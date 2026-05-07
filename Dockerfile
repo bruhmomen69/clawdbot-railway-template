@@ -10,6 +10,7 @@ RUN apt-get update \
     python3 \
     make \
     g++ \
+    golang-go \
   && rm -rf /var/lib/apt/lists/*
 
 # Install Bun (openclaw build uses it)
