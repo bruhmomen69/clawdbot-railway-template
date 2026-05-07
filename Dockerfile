@@ -50,7 +50,7 @@ RUN apt-get update \
     python3 \
     python3-venv \
     golang-go \
-    build-essentials \
+    build-essential \
     vim \
   && rm -rf /var/lib/apt/lists/*
 
