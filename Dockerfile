@@ -52,7 +52,10 @@ RUN apt-get update \
     golang-go \
     build-essential \
     vim \
+    python3-pip \
   && rm -rf /var/lib/apt/lists/*
+
+RUN pip install markitdown[all] --break-system-packages
 
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
