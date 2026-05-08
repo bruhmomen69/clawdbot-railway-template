@@ -53,6 +53,7 @@ RUN apt-get update \
     build-essential \
     vim \
     python3-pip \
+    ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
 RUN pip install markitdown[all] --break-system-packages
