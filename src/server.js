@@ -43,32 +43,47 @@ const WORKSPACE_DIR =
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
-// Gateway admin token (protects OpenClaw gateway + Control UI).
-// Must be stable across restarts. If not provided via env, persist it in the state dir.
-function resolveGatewayToken() {
-  const envTok = process.env.OPENCLAW_GATEWAY_TOKEN?.trim();
-  if (envTok) return envTok;
+function clampInt(raw, fallback, min, max) {
+  const parsed = Number.parseInt(String(raw ?? ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
 
-  const tokenPath = path.join(STATE_DIR, "gateway.token");
+function resolveStableSecret(envValue, fileName, bytes = 32) {
+  const envSecret = envValue?.trim();
+  if (envSecret) return envSecret;
+
+  const secretPath = path.join(STATE_DIR, fileName);
   try {
-    const existing = fs.readFileSync(tokenPath, "utf8").trim();
+    const existing = fs.readFileSync(secretPath, "utf8").trim();
     if (existing) return existing;
   } catch {
     // ignore
   }
 
-  const generated = crypto.randomBytes(32).toString("hex");
+  const generated = crypto.randomBytes(bytes).toString("hex");
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(tokenPath, generated, { encoding: "utf8", mode: 0o600 });
+    fs.writeFileSync(secretPath, generated, { encoding: "utf8", mode: 0o600 });
   } catch {
     // best-effort
   }
   return generated;
 }
 
-const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
+// Gateway admin token (protects OpenClaw gateway + Control UI).
+// Must be stable across restarts. If not provided via env, persist it in the state dir.
+const OPENCLAW_GATEWAY_TOKEN = resolveStableSecret(process.env.OPENCLAW_GATEWAY_TOKEN, "gateway.token");
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
+
+const SESSION_COOKIE_NAME = "openclaw_session";
+const SESSION_TTL_HOURS = clampInt(process.env.OPENCLAW_SESSION_TTL_HOURS, 72, 1, 24 * 30);
+const SESSION_TTL_MS = SESSION_TTL_HOURS * 60 * 60 * 1000;
+const OPENCLAW_SESSION_SECRET = resolveStableSecret(process.env.OPENCLAW_SESSION_SECRET, "session.secret");
+const AUTH_RATE_LIMIT_WINDOW_MS = clampInt(process.env.OPENCLAW_AUTH_RATE_LIMIT_WINDOW_SECONDS, 900, 60, 3600) * 1000;
+const AUTH_RATE_LIMIT_BLOCK_MS = clampInt(process.env.OPENCLAW_AUTH_RATE_LIMIT_BLOCK_SECONDS, 900, 60, 24 * 3600) * 1000;
+const AUTH_RATE_LIMIT_MAX_ATTEMPTS = clampInt(process.env.OPENCLAW_AUTH_RATE_LIMIT_MAX_ATTEMPTS, 10, 2, 100);
+const authFailureBuckets = new Map();
 
 // Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10);
@@ -271,6 +286,339 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
+function parseCookies(header) {
+  const out = {};
+  for (const rawPart of String(header || "").split(";")) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function constantTimeEqual(a, b) {
+  const left = Buffer.from(String(a ?? ""), "utf8");
+  const right = Buffer.from(String(b ?? ""), "utf8");
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function extractBasicPassword(header) {
+  const [scheme, encoded] = String(header || "").split(" ");
+  if (scheme !== "Basic" || !encoded) return null;
+
+  let decoded = "";
+  try {
+    decoded = Buffer.from(encoded, "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+
+  const idx = decoded.indexOf(":");
+  if (idx < 0) return null;
+  return decoded.slice(idx + 1);
+}
+
+function createSessionSigningKey() {
+  return crypto
+    .createHmac("sha256", OPENCLAW_SESSION_SECRET)
+    .update(`openclaw-session-key\0${SETUP_PASSWORD || ""}`)
+    .digest();
+}
+
+function signSessionPayload(payload) {
+  return crypto
+    .createHmac("sha256", createSessionSigningKey())
+    .update(payload)
+    .digest("base64url");
+}
+
+function mintSessionToken() {
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  const nonce = crypto.randomBytes(16).toString("base64url");
+  const payload = `v1.${expiresAt}.${nonce}`;
+  const signature = signSessionPayload(payload);
+  return { token: `${payload}.${signature}`, expiresAt };
+}
+
+function verifySessionToken(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 4) return { ok: false, reason: "malformed" };
+  const [version, expiresAtRaw, nonce, signature] = parts;
+  if (version !== "v1" || !nonce || !signature) return { ok: false, reason: "malformed" };
+
+  const expiresAt = Number.parseInt(expiresAtRaw, 10);
+  if (!Number.isFinite(expiresAt)) return { ok: false, reason: "malformed" };
+  if (expiresAt <= Date.now()) return { ok: false, reason: "expired" };
+
+  const payload = `${version}.${expiresAt}.${nonce}`;
+  const expected = signSessionPayload(payload);
+  if (!constantTimeEqual(signature, expected)) {
+    return { ok: false, reason: "invalid-signature" };
+  }
+
+  return { ok: true, expiresAt };
+}
+
+function getRequestHost(req) {
+  return String(req.headers.host || "").trim();
+}
+
+function getRequestHostname(req) {
+  const host = getRequestHost(req);
+  const raw = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0];
+  return raw.trim().toLowerCase();
+}
+
+function isLoopbackHostname(hostname) {
+  const h = String(hostname || "").trim().toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "::1" || h.endsWith(".localhost");
+}
+
+function shouldUseSecureSessionCookie(req) {
+  return !isLoopbackHostname(getRequestHostname(req));
+}
+
+function getRequestProtocol(req) {
+  const forwarded = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  if (forwarded === "https" || forwarded === "http") return forwarded;
+  return req.socket?.encrypted ? "https" : "http";
+}
+
+function getRequestOrigin(req) {
+  const host = getRequestHost(req);
+  if (!host) return null;
+  return `${getRequestProtocol(req)}://${host}`;
+}
+
+function getClientAddress(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwarded || req.socket?.remoteAddress || "unknown";
+}
+
+function getRateLimitBucket(req) {
+  const now = Date.now();
+  const key = getClientAddress(req);
+  const existing = authFailureBuckets.get(key);
+
+  if (existing?.blockedUntil && existing.blockedUntil > now) {
+    return { key, state: existing };
+  }
+
+  if (existing?.blockedUntil && existing.blockedUntil <= now) {
+    authFailureBuckets.delete(key);
+    return { key, state: null };
+  }
+
+  if (existing?.resetAt && existing.resetAt <= now) {
+    authFailureBuckets.delete(key);
+    return { key, state: null };
+  }
+
+  return { key, state: existing || null };
+}
+
+function getAuthRateLimitStatus(req) {
+  const { state } = getRateLimitBucket(req);
+  if (!state?.blockedUntil) return { blocked: false };
+  return {
+    blocked: true,
+    retryAfterSeconds: Math.max(1, Math.ceil((state.blockedUntil - Date.now()) / 1000)),
+  };
+}
+
+function shouldRecordAuthFailure(reason) {
+  return reason === "invalid-password" || reason === "invalid-signature" || reason === "malformed";
+}
+
+function recordAuthFailure(req) {
+  const now = Date.now();
+  const { key, state } = getRateLimitBucket(req);
+  const next = state && state.resetAt > now
+    ? { ...state, count: state.count + 1 }
+    : { count: 1, resetAt: now + AUTH_RATE_LIMIT_WINDOW_MS, blockedUntil: 0 };
+
+  if (next.count >= AUTH_RATE_LIMIT_MAX_ATTEMPTS) {
+    next.blockedUntil = now + AUTH_RATE_LIMIT_BLOCK_MS;
+  }
+
+  authFailureBuckets.set(key, next);
+  return {
+    blocked: Boolean(next.blockedUntil && next.blockedUntil > now),
+    retryAfterSeconds: next.blockedUntil ? Math.max(1, Math.ceil((next.blockedUntil - now) / 1000)) : 0,
+  };
+}
+
+function clearAuthFailures(req) {
+  authFailureBuckets.delete(getRateLimitBucket(req).key);
+}
+
+function hasTrustedSameOrigin(req) {
+  const requestOrigin = getRequestOrigin(req);
+  if (!requestOrigin) return false;
+
+  const origin = String(req.headers.origin || "").trim();
+  if (origin) return origin === requestOrigin;
+
+  const referer = String(req.headers.referer || "").trim();
+  if (!referer) return false;
+
+  try {
+    return new URL(referer).origin === requestOrigin;
+  } catch {
+    return false;
+  }
+}
+
+function isBrowserLikeRequest(req) {
+  return Boolean(req.headers.origin || req.headers.referer || req.headers["sec-fetch-site"]);
+}
+
+const SECURITY_HEADERS = {
+  "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+  "Referrer-Policy": "same-origin",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+};
+
+function applySecurityHeaders(target) {
+  if (typeof target?.set === "function") {
+    for (const [key, value] of Object.entries(SECURITY_HEADERS)) target.set(key, value);
+    return;
+  }
+  if (target && typeof target === "object") {
+    for (const [key, value] of Object.entries(SECURITY_HEADERS)) target[key] = value;
+  }
+}
+
+function clearSessionCookie(res, req) {
+  res.clearCookie(SESSION_COOKIE_NAME, {
+    path: "/",
+    httpOnly: true,
+    sameSite: "strict",
+    secure: shouldUseSecureSessionCookie(req),
+  });
+}
+
+function issueSessionCookie(res, req) {
+  const session = mintSessionToken();
+  res.cookie(SESSION_COOKIE_NAME, session.token, {
+    path: "/",
+    httpOnly: true,
+    sameSite: "strict",
+    secure: shouldUseSecureSessionCookie(req),
+    maxAge: SESSION_TTL_MS,
+  });
+}
+
+function authenticateOperatorRequest(req, opts = {}) {
+  const allowSessionCookie = opts.allowSessionCookie !== false;
+  let clearInvalidSession = false;
+  let sessionFailureReason = null;
+
+  if (allowSessionCookie) {
+    const sessionCookie = parseCookies(req.headers.cookie || "")[SESSION_COOKIE_NAME];
+    if (sessionCookie) {
+      const session = verifySessionToken(sessionCookie);
+      if (session.ok) return { ok: true, method: "session", expiresAt: session.expiresAt };
+      clearInvalidSession = true;
+      sessionFailureReason = session.reason;
+    }
+  }
+
+  const password = extractBasicPassword(req.headers.authorization);
+  if (password === null) {
+    return {
+      ok: false,
+      reason: sessionFailureReason || "missing-basic-auth",
+      clearSessionCookie: clearInvalidSession,
+    };
+  }
+  if (!constantTimeEqual(password, SETUP_PASSWORD || "")) {
+    return { ok: false, reason: "invalid-password", clearSessionCookie: clearInvalidSession };
+  }
+  return { ok: true, method: "basic", issueSessionCookie: true, clearSessionCookie: clearInvalidSession };
+}
+
+function enforceAuthenticatedRequestContext(req, authResult) {
+  const safeMethod = new Set(["GET", "HEAD", "OPTIONS"]);
+  if (safeMethod.has(String(req.method || "").toUpperCase())) return { ok: true };
+  if (hasTrustedSameOrigin(req)) return { ok: true };
+  if (authResult.method === "basic" && !isBrowserLikeRequest(req)) return { ok: true };
+  return { ok: false, status: 403, body: "Cross-site authenticated requests are not allowed" };
+}
+
+function enforceAuthenticatedUpgradeContext(req, authResult) {
+  if (hasTrustedSameOrigin(req)) return { ok: true };
+  if (authResult.method === "basic" && !isBrowserLikeRequest(req)) return { ok: true };
+  return { ok: false, status: 403, body: "Cross-site authenticated requests are not allowed\n" };
+}
+
+function writeBasicAuthChallenge(res, realm, message) {
+  res.set("WWW-Authenticate", `Basic realm="${realm}"`);
+  return res.status(401).send(message);
+}
+
+function writeRateLimited(res, retryAfterSeconds) {
+  res.set("Retry-After", String(retryAfterSeconds));
+  return res.status(429).type("text/plain").send("Too many failed authentication attempts");
+}
+
+function writeUpgradeResponse(socket, status, body, extraHeaders = {}) {
+  const reason = {
+    401: "Unauthorized",
+    403: "Forbidden",
+    429: "Too Many Requests",
+    503: "Service Unavailable",
+  }[status] || "Error";
+  const headers = {
+    Connection: "close",
+    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    ...extraHeaders,
+  };
+  const head = Object.entries(headers)
+    .map(([key, value]) => `${key}: ${value}`)
+    .join("\r\n");
+  socket.end(`HTTP/1.1 ${status} ${reason}\r\n${head}\r\n\r\n${body}`);
+}
+
+function requireAuth(req, res, next, opts) {
+  const authResult = authenticateOperatorRequest(req, opts);
+  if (!authResult.ok) {
+    const rateLimit = getAuthRateLimitStatus(req);
+    if (rateLimit.blocked) {
+      return writeRateLimited(res, rateLimit.retryAfterSeconds);
+    }
+    if (authResult.clearSessionCookie) clearSessionCookie(res, req);
+    if (shouldRecordAuthFailure(authResult.reason)) {
+      const failure = recordAuthFailure(req);
+      if (failure.blocked) return writeRateLimited(res, failure.retryAfterSeconds);
+    }
+    const message = authResult.reason === "invalid-password" ? "Invalid password" : "Auth required";
+    return writeBasicAuthChallenge(res, opts.realm, message);
+  }
+
+  const context = enforceAuthenticatedRequestContext(req, authResult);
+  if (!context.ok) {
+    return res.status(context.status).type("text/plain").send(context.body);
+  }
+
+  clearAuthFailures(req);
+  if (authResult.clearSessionCookie) clearSessionCookie(res, req);
+  if (authResult.issueSessionCookie) issueSessionCookie(res, req);
+  req.operatorAuth = authResult;
+  return next();
+}
+
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -279,25 +627,53 @@ function requireSetupAuth(req, res, next) {
       .send("SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.");
   }
 
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Auth required");
+  return requireAuth(req, res, next, { realm: "OpenClaw Setup" });
+}
+
+function authorizeDashboardUpgrade(req, socket) {
+  if (!SETUP_PASSWORD) return { ok: true, method: "open" };
+
+  const authResult = authenticateOperatorRequest(req);
+  if (!authResult.ok) {
+    const rateLimit = getAuthRateLimitStatus(req);
+    if (rateLimit.blocked) {
+      writeUpgradeResponse(socket, 429, "Too many failed authentication attempts\n", {
+        "Retry-After": String(rateLimit.retryAfterSeconds),
+      });
+      return { ok: false };
+    }
+    if (shouldRecordAuthFailure(authResult.reason)) {
+      const failure = recordAuthFailure(req);
+      if (failure.blocked) {
+        writeUpgradeResponse(socket, 429, "Too many failed authentication attempts\n", {
+          "Retry-After": String(failure.retryAfterSeconds),
+        });
+        return { ok: false };
+      }
+    }
+    writeUpgradeResponse(socket, 401, "Auth required\n", {
+      "WWW-Authenticate": 'Basic realm="OpenClaw Dashboard"',
+    });
+    return { ok: false };
   }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Invalid password");
+
+  const context = enforceAuthenticatedUpgradeContext(req, authResult);
+  if (!context.ok) {
+    writeUpgradeResponse(socket, context.status, context.body);
+    return { ok: false };
   }
-  return next();
+
+  clearAuthFailures(req);
+  return authResult;
 }
 
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
+app.use((req, res, next) => {
+  applySecurityHeaders(res);
+  next();
+});
 
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
@@ -1120,11 +1496,11 @@ app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
 });
 
 app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
-  const { channel, code } = req.body || {};
-  if (!channel || !code) {
-    return res.status(400).json({ ok: false, error: "Missing channel or code" });
+  const validation = validatePairingApprovalInput(req.body?.channel, req.body?.code);
+  if (!validation.ok) {
+    return res.status(400).json({ ok: false, error: validation.error });
   }
-  const r = await runCmd(OPENCLAW_NODE, clawArgs(["pairing", "approve", String(channel), String(code)]));
+  const r = await runCmd(OPENCLAW_NODE, clawArgs(["pairing", "approve", validation.channel, validation.code]));
   return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: r.output });
 });
 
@@ -1237,6 +1613,28 @@ function looksSafeTarPath(p) {
   return true;
 }
 
+function looksSafeTarEntry(p, entry) {
+  if (!looksSafeTarPath(p)) return false;
+  return entry?.type === "File" || entry?.type === "OldFile" || entry?.type === "Directory";
+}
+
+function validatePairingApprovalInput(channel, code) {
+  const normalizedChannel = String(channel || "").trim().toLowerCase();
+  const normalizedCode = String(code || "").trim();
+
+  if (!normalizedChannel || !normalizedCode) {
+    return { ok: false, error: "Missing channel or code" };
+  }
+  if (normalizedChannel !== "telegram" && normalizedChannel !== "discord") {
+    return { ok: false, error: "Invalid channel" };
+  }
+  if (!/^[A-Za-z0-9_-]{4,128}$/.test(normalizedCode)) {
+    return { ok: false, error: "Invalid pairing code" };
+  }
+
+  return { ok: true, channel: normalizedChannel, code: normalizedCode };
+}
+
 async function readBodyBuffer(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1258,6 +1656,7 @@ async function readBodyBuffer(req, maxBytes) {
 // Import a backup created by /setup/export.
 // This is intentionally limited to restoring into /data to avoid overwriting arbitrary host paths.
 app.post("/setup/import", requireSetupAuth, async (req, res) => {
+  let tmpPath = null;
   try {
     const dataRoot = "/data";
     if (!isUnderDir(STATE_DIR, dataRoot) || !isUnderDir(WORKSPACE_DIR, dataRoot)) {
@@ -1280,7 +1679,7 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
     // Extract into /data.
     // We only allow safe relative paths, and we intentionally do NOT delete existing files.
     // (Users can reset/redeploy or manually clean the volume if desired.)
-    const tmpPath = path.join(os.tmpdir(), `openclaw-import-${Date.now()}.tar.gz`);
+    tmpPath = path.join(os.tmpdir(), `openclaw-import-${crypto.randomUUID()}.tar.gz`);
     fs.writeFileSync(tmpPath, buf);
 
     await tar.x({
@@ -1289,13 +1688,8 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
       gzip: true,
       strict: true,
       onwarn: () => {},
-      filter: (p) => {
-        // Allow only paths that look safe.
-        return looksSafeTarPath(p);
-      },
+      filter: (p, entry) => looksSafeTarEntry(p, entry),
     });
-
-    try { fs.rmSync(tmpPath, { force: true }); } catch {}
 
     // Restart gateway after restore.
     if (isConfigured()) {
@@ -1306,6 +1700,10 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
   } catch (err) {
     console.error("[import]", err);
     res.status(500).type("text/plain").send(String(err));
+  } finally {
+    if (tmpPath) {
+      try { fs.rmSync(tmpPath, { force: true }); } catch {}
+    }
   }
 });
 
@@ -1328,27 +1726,19 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
+proxy.on("proxyRes", (proxyRes) => {
+  applySecurityHeaders(proxyRes.headers);
+});
+
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
-// not just the /setup routes.  Healthcheck is excluded so Railway probes work.
+// not just the /setup routes. Successful Basic auth mints a session cookie
+// so the browser can reuse it for normal requests and WebSocket upgrades.
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
   if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
   if (!SETUP_PASSWORD) return next(); // no password configured → open
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Auth required");
-  }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Invalid password");
-  }
-  return next();
+  return requireAuth(req, res, next, { realm: "OpenClaw Dashboard" });
 }
 
 // --- Gateway token injection ---
@@ -1460,9 +1850,8 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
-  // Note: browsers cannot attach arbitrary HTTP headers (including Authorization: Basic)
-  // in WebSocket handshakes. Do not enforce dashboard Basic auth at the upgrade layer.
-  // The gateway authenticates at the protocol layer and we inject the gateway token below.
+  const authResult = authorizeDashboardUpgrade(req, socket);
+  if (!authResult.ok) return;
 
   if (!isConfigured()) {
     socket.destroy();

@@ -13,7 +13,7 @@ This repo packages **OpenClaw** for Railway with a small **/setup** web wizard s
 ## How it works (high level)
 
 - The container runs a wrapper web server.
-- The wrapper protects `/setup` (and the Control UI at `/openclaw`) with `SETUP_PASSWORD` using HTTP Basic auth.
+- The wrapper protects `/setup` (and the Control UI at `/openclaw`) with `SETUP_PASSWORD` using HTTP Basic auth, then mints a hardened session cookie so the browser can keep using HTTP + WebSocket routes for a few days without repeated prompts.
 - During setup, the wrapper runs `openclaw onboard --non-interactive ...` inside the container, writes state to the volume, and then starts the gateway.
 - After setup, **`/` is OpenClaw**. The wrapper reverse-proxies all traffic (including WebSockets) to the local gateway process.
 
@@ -34,6 +34,9 @@ Recommended:
 
 Optional:
 - `OPENCLAW_GATEWAY_TOKEN` — if not set, the wrapper generates one (not ideal). In a template, set it using a generated secret.
+- `OPENCLAW_SESSION_SECRET` — if set, used to sign operator session cookies. If not set, the wrapper persists one under the state dir.
+- `OPENCLAW_SESSION_TTL_HOURS` — how long the operator session cookie stays valid (default: `72`).
+- `OPENCLAW_AUTH_RATE_LIMIT_MAX_ATTEMPTS` / `OPENCLAW_AUTH_RATE_LIMIT_WINDOW_SECONDS` / `OPENCLAW_AUTH_RATE_LIMIT_BLOCK_SECONDS` — tune auth brute-force protection if you need stricter or looser limits.
 
 Notes:
 - This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
@@ -44,9 +47,10 @@ Notes:
 
 Then:
 - Visit `https://<your-app>.up.railway.app/setup`
-  - Your browser will prompt for **HTTP Basic auth**. Use any username; the password is `SETUP_PASSWORD`.
+  - Your browser will prompt for **HTTP Basic auth** once. Use any username; the password is `SETUP_PASSWORD`.
+  - After a successful login, the wrapper sets an **HttpOnly, SameSite=Strict session cookie** that the browser reuses for `/setup`, `/openclaw`, and WebSocket upgrades.
 - Complete setup
-- Visit `https://<your-app>.up.railway.app/` and `/openclaw` (same Basic auth)
+- Visit `https://<your-app>.up.railway.app/` and `/openclaw` (the session cookie is reused automatically)
 
 ## Support / community
 
