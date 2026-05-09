@@ -56,6 +56,7 @@ RUN apt-get update \
     ffmpeg \
     jq \
     nano \
+    ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
 RUN pip install markitdown[all] --break-system-packages
