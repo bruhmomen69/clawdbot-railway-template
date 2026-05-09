@@ -72,6 +72,9 @@ ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
 ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
 
+# Install global NPM tools
+RUN npm i -g @steipete/summarize
+
 WORKDIR /app
 
 # Wrapper deps
