@@ -769,6 +769,13 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     </div>
 
     <div style="margin-top: 0.75rem">
+      <div class="muted" style="margin-bottom:0.25rem"><strong>Upload workspace file</strong>: adds a new file to the OpenClaw workspace root. Existing files cannot be replaced.</div>
+      <input id="workspaceFile" type="file" />
+      <button id="workspaceUpload" style="margin-top:0.5rem">Upload to workspace</button>
+      <pre id="workspaceOut" style="white-space:pre-wrap"></pre>
+    </div>
+
+    <div style="margin-top: 0.75rem">
       <div class="muted" style="margin-bottom:0.25rem"><strong>Import backup</strong> (advanced): restores into <code>/data</code> and restarts the gateway.</div>
       <input id="importFile" type="file" accept=".tar.gz,application/gzip" />
       <button id="importRun" style="background:#7c2d12; margin-top:0.5rem">Import</button>
@@ -961,6 +968,7 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   res.json({
     configured: isConfigured(),
     gatewayTarget: GATEWAY_TARGET,
+    workspaceDir: WORKSPACE_DIR,
     openclawVersion: version.output.trim(),
     channelsAddHelp: channelsHelp.output,
     authGroups: AUTH_GROUPS,
@@ -1635,6 +1643,28 @@ function validatePairingApprovalInput(channel, code) {
   return { ok: true, channel: normalizedChannel, code: normalizedCode };
 }
 
+function validateWorkspaceUploadFileName(rawName) {
+  let fileName = String(rawName || "").trim();
+  if (!fileName) {
+    return { ok: false, error: "Missing file name" };
+  }
+
+  try {
+    fileName = decodeURIComponent(fileName);
+  } catch {
+    // Keep the original value if it was not URI-encoded.
+  }
+
+  if (!fileName || fileName === "." || fileName === "..") {
+    return { ok: false, error: "Invalid file name" };
+  }
+  if (/[\\/\0\r\n]/.test(fileName)) {
+    return { ok: false, error: "File name must not include directories" };
+  }
+
+  return { ok: true, fileName };
+}
+
 async function readBodyBuffer(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1652,6 +1682,44 @@ async function readBodyBuffer(req, maxBytes) {
     req.on("error", reject);
   });
 }
+
+app.post("/setup/api/workspace/upload", requireSetupAuth, async (req, res) => {
+  try {
+    const validation = validateWorkspaceUploadFileName(req.headers["x-openclaw-filename"]);
+    if (!validation.ok) {
+      return res.status(400).json({ ok: false, error: validation.error });
+    }
+
+    const buf = await readBodyBuffer(req, 100 * 1024 * 1024);
+    fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+    const filePath = path.join(WORKSPACE_DIR, validation.fileName);
+    if (!isUnderDir(filePath, WORKSPACE_DIR)) {
+      return res.status(400).json({ ok: false, error: "Invalid file path" });
+    }
+
+    try {
+      fs.writeFileSync(filePath, buf, { flag: "wx", mode: 0o600 });
+    } catch (err) {
+      if (err && typeof err === "object" && "code" in err && err.code === "EEXIST") {
+        return res.status(409).json({ ok: false, error: "File already exists in the workspace" });
+      }
+      throw err;
+    }
+
+    return res.status(201).json({
+      ok: true,
+      fileName: validation.fileName,
+      bytes: buf.length,
+    });
+  } catch (err) {
+    if (String(err?.message || err) === "payload too large") {
+      return res.status(413).json({ ok: false, error: "File is too large" });
+    }
+    console.error("[workspace upload]", err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
 
 // Import a backup created by /setup/export.
 // This is intentionally limited to restoring into /data to avoid overwriting arbitrary host paths.

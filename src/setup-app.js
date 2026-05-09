@@ -26,6 +26,11 @@
   var importRunEl = document.getElementById('importRun');
   var importOutEl = document.getElementById('importOut');
 
+  // Workspace upload
+  var workspaceFileEl = document.getElementById('workspaceFile');
+  var workspaceUploadEl = document.getElementById('workspaceUpload');
+  var workspaceOutEl = document.getElementById('workspaceOut');
+
   function setStatus(s) {
     statusEl.textContent = s;
   }
@@ -115,6 +120,7 @@
       if (statusDetailsEl) {
         var parts = [];
         parts.push('Gateway target: ' + (j.gatewayTarget || '(unknown)'));
+        parts.push('Workspace dir: ' + (j.workspaceDir || '(unknown)'));
         parts.push('Tip: /healthz shows wrapper+gateway reachability.');
         statusDetailsEl.textContent = parts.join('\n');
       }
@@ -272,6 +278,42 @@
   }
 
   if (importRunEl) importRunEl.onclick = runImport;
+
+  function runWorkspaceUpload() {
+    if (!workspaceUploadEl || !workspaceFileEl) return;
+    var f = workspaceFileEl.files && workspaceFileEl.files[0];
+    if (!f) {
+      alert('Pick a file first');
+      return;
+    }
+
+    if (workspaceOutEl) workspaceOutEl.textContent = 'Uploading ' + f.name + ' (' + f.size + ' bytes)...\n';
+
+    return f.arrayBuffer().then(function (buf) {
+      return fetch('/setup/api/workspace/upload', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-openclaw-filename': encodeURIComponent(f.name)
+        },
+        body: buf
+      });
+    }).then(function (res) {
+      return res.text().then(function (text) {
+        var j;
+        try { j = JSON.parse(text); } catch (_e) { j = { ok: false, error: text }; }
+        if (!res.ok) throw new Error((j && j.error) || ('HTTP ' + res.status));
+        if (workspaceOutEl) workspaceOutEl.textContent += 'Uploaded as ' + (j.fileName || f.name) + '. Existing files cannot be replaced.\n';
+        workspaceFileEl.value = '';
+        return refreshStatus();
+      });
+    }).catch(function (e) {
+      if (workspaceOutEl) workspaceOutEl.textContent += '\nError: ' + String(e) + '\n';
+    });
+  }
+
+  if (workspaceUploadEl) workspaceUploadEl.onclick = runWorkspaceUpload;
 
   // Pairing approve helper
   var pairingBtn = document.getElementById('pairingApprove');

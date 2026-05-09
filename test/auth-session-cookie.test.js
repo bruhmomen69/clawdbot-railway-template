@@ -82,6 +82,7 @@ async function startServer(envOverrides = {}) {
 
   return {
     baseUrl: `http://127.0.0.1:${port}`,
+    workspaceDir,
     async close() {
       if (proc.exitCode !== null) {
         fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -202,6 +203,55 @@ test("failed auth attempts are rate limited without locking out valid credential
     headers: { Authorization: basicAuth("wrong-password") },
   });
   assert.equal(reset.status, 401);
+});
+
+test("workspace upload stores only new files and rejects overwrites", async (t) => {
+  const server = await startServer();
+  t.after(() => server.close());
+
+  const loginRes = await fetch(`${server.baseUrl}/setup`, {
+    headers: { Authorization: basicAuth("test-password") },
+  });
+  assert.equal(loginRes.status, 200);
+
+  const setCookie = loginRes.headers.getSetCookie().find((value) => value.startsWith("openclaw_session="));
+  assert.ok(setCookie, "expected openclaw_session cookie");
+  const cookie = setCookie.split(";", 1)[0];
+
+  const firstRes = await fetch(`${server.baseUrl}/setup/api/workspace/upload`, {
+    method: "POST",
+    headers: {
+      Cookie: cookie,
+      Origin: server.baseUrl,
+      "Content-Type": "application/octet-stream",
+      "X-OpenClaw-Filename": encodeURIComponent("notes.txt"),
+    },
+    body: Buffer.from("first file\n", "utf8"),
+  });
+  assert.equal(firstRes.status, 201);
+  assert.deepEqual(await firstRes.json(), {
+    ok: true,
+    fileName: "notes.txt",
+    bytes: 11,
+  });
+  assert.equal(fs.readFileSync(path.join(server.workspaceDir, "notes.txt"), "utf8"), "first file\n");
+
+  const secondRes = await fetch(`${server.baseUrl}/setup/api/workspace/upload`, {
+    method: "POST",
+    headers: {
+      Cookie: cookie,
+      Origin: server.baseUrl,
+      "Content-Type": "application/octet-stream",
+      "X-OpenClaw-Filename": encodeURIComponent("notes.txt"),
+    },
+    body: Buffer.from("replacement\n", "utf8"),
+  });
+  assert.equal(secondRes.status, 409);
+
+  const secondJson = await secondRes.json();
+  assert.equal(secondJson.ok, false);
+  assert.match(secondJson.error, /already exists/i);
+  assert.equal(fs.readFileSync(path.join(server.workspaceDir, "notes.txt"), "utf8"), "first file\n");
 });
 
 test("websocket upgrades require authentication instead of bypassing it", async (t) => {
