@@ -60,6 +60,9 @@ RUN apt-get update \
 
 RUN pip install markitdown[all] --break-system-packages
 
+# Install global NPM tools BEFORE setting npm prefix to a non-root location, so they are available in the runtime image.
+RUN npm i -g @steipete/summarize
+
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
@@ -71,9 +74,6 @@ ENV NPM_CONFIG_CACHE=/data/npm-cache
 ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
 ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
-
-# Install global NPM tools
-RUN npm i -g @steipete/summarize
 
 WORKDIR /app
 
