@@ -59,7 +59,9 @@ RUN apt-get update \
     ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
+# Python and Go deps
 RUN pip install markitdown[all] --break-system-packages
+RUN go install github.com/Hyaxia/blogwatcher/cmd/blogwatcher@v0.0.3
 
 # Install global NPM tools BEFORE setting npm prefix to a non-root location, so they are available in the runtime image.
 RUN npm i -g @steipete/summarize
