@@ -54,6 +54,8 @@ RUN apt-get update \
     vim \
     python3-pip \
     ffmpeg \
+    jq \
+    nano \
   && rm -rf /var/lib/apt/lists/*
 
 RUN pip install markitdown[all] --break-system-packages
